@@ -1,0 +1,534 @@
+diff --git a/Kconfig b/Kconfig
+index 4bacd8f..2e2ffe7 100644
+--- a/Kconfig
++++ b/Kconfig
+@@ -7,13 +7,6 @@ menu "Character devices"
+ 
+ source "drivers/tty/Kconfig"
+ 
+-config PDS14_DRIVER
+-	tristate "Driver made by Pavle Lakic PDS14"
+-	depends on ARCH_VEXPRESS
+-	default y
+-	help
+-	  This is student made driver, prone to errors, when in doubt, say "N".
+-
+ config DEVMEM
+ 	bool "/dev/mem virtual device support"
+ 	default y
+diff --git a/Makefile b/Makefile
+index d883939..b8d42b4 100644
+--- a/Makefile
++++ b/Makefile
+@@ -58,4 +58,3 @@ js-rtc-y = rtc.o
+ obj-$(CONFIG_XILLYBUS)		+= xillybus/
+ obj-$(CONFIG_POWERNV_OP_PANEL)	+= powernv-op-panel.o
+ obj-$(CONFIG_ADI)		+= adi.o
+-obj-$(CONFIG_PDS14_DRIVER)	+= pds-mmsens.o
+diff --git a/pds-mmsens.c b/pds-mmsens.c
+deleted file mode 100644
+index b30325f..0000000
+--- a/pds-mmsens.c
++++ /dev/null
+@@ -1,501 +0,0 @@
+-/* pds_mmsens.c */
+-
+-#include <linux/init.h>
+-#include <linux/module.h>
+-#include <linux/io.h>
+-#include <linux/interrupt.h>
+-#include <linux/uaccess.h>
+-#include <linux/fs.h>
+-#include <linux/cdev.h>
+-#include <linux/platform_device.h>
+-#include <linux/of.h>
+-#include <linux/poll.h>
+-
+-#define DRIVER_NAME		"pds-14mmsdrv"
+-#define DEVICE_FILE_NAME	"pds14_mmsensor"
+-
+-#define PDS14_CTRL_OFFSET	(0x00)
+-#define PDS14_STATUS_OFFSET	(0x04)
+-#define PDS14_DATA_OFFSET	(0x08)
+-
+-#define CTRL_EN_MASK		(1 << 8)
+-#define CTRL_IEN_MASK		(1 << 9)
+-#define CTRL_RES_MASK		(1 << 10)
+-#define CTRL_SPEED_MASK		(1 << 11)
+-
+-#define STATUS_IFG_MASK		(1 << 9)
+-
+-#define DATA_MASK		(0x0000FFFF)
+-
+-static struct class* pds14_class;
+-
+-static DECLARE_WAIT_QUEUE_HEAD(read_wq);
+-
+-static inline u32 raw_to_mV(u32 data, u32 resolution)
+-{
+-	u32 data_mv=data;
+-	u32 ceo_deo;
+-	u32 ostatak;
+-	
+-	u32 fine_mask = 0xfffffff0;
+-	u32 coarse_mask = 0xffffff00;
+-
+-	if (resolution == 1) {
+-		data &= coarse_mask;
+-		data = data >> 8;
+-		ceo_deo = (data >> 3) * 1000;
+-		ostatak = ((data & 0x00000004) >> 2) * 500 + ((data & 0x00000002) >> 1) * 250 + (data & 0x00000001) * 125;
+-
+-	}
+-	else if (resolution == 0) {
+-		data &= fine_mask;
+-		data = data >> 4;
+-		ceo_deo = (data >> 8) * 1000;
+-		ostatak = (((data & 0x00000040) >> 6) * 500) + (((data & 0x00000020) >> 5) * 250) + \
+-			(((data & 0x00000010) >> 4) * 125) + (((data & 0x00000008) >> 3) * 62) + (((data & 0x00000004) >> 2) * 32) + \
+-			(((data & 0x00000002) >> 1) * 15) + ((data & 0x00000001) * 7);
+-	}
+-	else
+-		return -EINVAL;
+-
+-	data_mv = ceo_deo + ostatak;
+-
+-	return data_mv;
+-}
+-
+-struct pds14_mms {
+-	void __iomem *base_addr;
+-	int irq;
+-	struct device *dev;
+-	struct device *parent;
+-	struct cdev cdev;
+-	dev_t devt;
+-	int alarm;
+-};
+-
+-static int pds14dev_open(struct inode *inode, struct file *filp) {
+-	struct pds14_mms *pds14dev;
+-
+-	/* store demodev pointer for read */
+-	pds14dev = container_of(inode->i_cdev, struct pds14_mms, cdev);
+-	filp->private_data = pds14dev;
+-
+-	return 0;
+-}
+-
+-static int pds14dev_release(struct inode *inode, struct file *filp) {
+-	return 0;
+-}
+-
+-static ssize_t pds14dev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos) {
+-	struct pds14_mms *pds14dev;
+-	/* buffer */
+-	static char buffer[10];
+-	/* Number of bytes written to the buffer */
+-	ssize_t bytes_read = 0;
+-	/* data storage */
+-	int data_reg;
+-
+-	if (*f_pos) {
+-		*f_pos = 0;
+-		return 0;
+-	}
+-
+-	pds14dev = filp->private_data;
+-
+-	/* read data from DATA register */
+-	data_reg = ioread32(pds14dev->base_addr+PDS14_DATA_OFFSET);
+-
+-	/* pack it into buffer */
+-	sprintf(buffer, "%d\n", data_reg);
+-	bytes_read = strlen(buffer);
+-
+-	/* copy_to_user */
+-	if (copy_to_user(buf, buffer, bytes_read)) {
+-		return -EFAULT;
+-	}
+-	*f_pos += bytes_read;
+-
+-	/* return number of bytes read */
+-	return bytes_read;
+-}
+-
+-static ssize_t int_en_show(struct device *child, struct device_attribute *attr, char *buf)
+-{
+-	struct pds14_mms *pds14dev = dev_get_drvdata(child);
+-
+-	u32 interrupt_enable = ioread32(pds14dev->base_addr + PDS14_CTRL_OFFSET);
+-	interrupt_enable &= CTRL_IEN_MASK;
+-
+-	return sprintf(buf, "%d\n", !!interrupt_enable);
+-}
+-
+-static ssize_t int_en_store(struct device *child, struct device_attribute *attr, const char *buf, size_t count)
+-{
+-	struct pds14_mms *pds14dev = dev_get_drvdata(child);
+-
+-	u32 ctrl = ioread32(pds14dev->base_addr + PDS14_CTRL_OFFSET);
+-
+-	int interrupt_enable;
+-	sscanf(buf, "%d", &interrupt_enable);
+-
+-	if (!interrupt_enable) {
+-		ctrl &= ~CTRL_IEN_MASK;
+-	} else {
+-		ctrl |= CTRL_IEN_MASK;
+-	}
+-
+-	iowrite32(ctrl, pds14dev->base_addr + PDS14_CTRL_OFFSET);
+-
+-	return count;
+-}
+-static DEVICE_ATTR_RW(int_en);
+-
+-static ssize_t enable_show(struct device *child, struct device_attribute *attr, char *buf)
+-{
+-	struct pds14_mms *pds14dev = dev_get_drvdata(child);
+-
+-	u32 enable = ioread32(pds14dev->base_addr + PDS14_CTRL_OFFSET);
+-	enable &= CTRL_EN_MASK;
+-
+-	return sprintf(buf, "%d\n", !!enable);
+-}
+-
+-static ssize_t enable_store(struct device *child, struct device_attribute *attr, const char *buf, size_t count)
+-{
+-	struct pds14_mms *pds14dev = dev_get_drvdata(child);
+-
+-	u32 ctrl = ioread32(pds14dev->base_addr + PDS14_CTRL_OFFSET);
+-
+-	int enable;
+-	sscanf(buf, "%d", &enable);
+-
+-	if (!enable) {
+-		ctrl &= ~CTRL_EN_MASK;
+-	} else {
+-		ctrl |= CTRL_EN_MASK;
+-	}
+-
+-	iowrite32(ctrl, pds14dev->base_addr + PDS14_CTRL_OFFSET);
+-
+-	return count;
+-}
+-static DEVICE_ATTR_RW(enable);
+-
+-static ssize_t data_raw_show(struct device *child, struct device_attribute *attr, char *buf)
+-{
+-	struct pds14_mms *pds14dev = dev_get_drvdata(child);
+-
+-	u32 data = ioread32(pds14dev->base_addr + PDS14_DATA_OFFSET);
+-	data &= DATA_MASK;
+-
+-	return sprintf(buf, "%d\n", data);
+-}
+-static DEVICE_ATTR_RO(data_raw);
+-
+-static ssize_t available_res_show(struct device *child, struct device_attribute *attr, char *buf)
+-{
+-	return sprintf(buf, "available resolutions: (fine, coarse)\n");
+-}
+-static DEVICE_ATTR_RO(available_res);
+-
+-static ssize_t current_res_show(struct device *child, struct device_attribute *attr, char *buf)
+-{
+-	struct pds14_mms *pds14dev = dev_get_drvdata(child);
+-	u32 resolution = ioread32(pds14dev->base_addr + PDS14_CTRL_OFFSET);
+-	resolution &= CTRL_RES_MASK;
+-	resolution >>= 10;
+-
+-	if (resolution == 1)
+-		return sprintf(buf, "resolution set to coarse\n");
+-	else if (resolution == 0)
+-		return sprintf(buf, "resolution set to fine\n");
+-	else
+-		return -EINVAL;
+-}
+-
+-static ssize_t current_res_store(struct device *child, struct device_attribute *attr,const char *buf,  size_t count)
+-{
+-
+-	struct pds14_mms *pds14dev = dev_get_drvdata(child);
+-	u32 new_res;
+-
+-	u32 resolution = ioread32(pds14dev->base_addr + PDS14_CTRL_OFFSET);
+-
+-	if ((*(buf + 0) == 'f') && (*(buf + 1) == 'i') && (*(buf + 2) == 'n') && (*(buf + 3) == 'e') && (*(buf + 4) == '\n') && (*(buf + 5) == '\0'))
+-		new_res = 0;
+-	else if ((*(buf + 0) == 'c') && (*(buf + 1) == 'o') && (*(buf + 2) == 'a') && (*(buf + 3) == 'r') && (*(buf + 4) == 's') && (*(buf + 5) == 'e') && (*(buf + 6) == '\n') && (*(buf + 7) == '\0'))
+-		new_res = 1;
+-	else 
+-		return -EINVAL;
+-
+-	resolution &= !CTRL_RES_MASK;
+-	new_res <<= 10;
+-	resolution |= new_res;
+-	iowrite32(resolution, pds14dev->base_addr +  PDS14_CTRL_OFFSET);
+-	return count;
+-	
+-}
+-static DEVICE_ATTR_RW(current_res);
+-
+-static ssize_t current_freq_show(struct device *child, struct device_attribute *attr, char *buf)
+-{
+-	struct pds14_mms *pds14dev = dev_get_drvdata(child);
+-	u32 frequency = ioread32(pds14dev->base_addr + PDS14_CTRL_OFFSET);
+-	frequency &= CTRL_SPEED_MASK;
+-	frequency >>= 11;
+-
+-	if (frequency == 1)
+-		return sprintf(buf, "sampling frequency set to fast\n");
+-	else if (frequency == 0)
+-		return sprintf(buf, "sampling frequency set to normal\n");
+-	else
+-		return -EINVAL;
+-}
+-
+-static ssize_t current_freq_store(struct device *child, struct device_attribute *attr,const char *buf,  size_t count)
+-{
+-
+-	struct pds14_mms *pds14dev = dev_get_drvdata(child);
+-	u32 new_freq;
+-
+-	u32 frequency = ioread32(pds14dev->base_addr + PDS14_CTRL_OFFSET);
+-
+-	if ((*(buf + 0) == 'n') && (*(buf + 1) == 'o') && (*(buf + 2) == 'r') && (*(buf + 3) == 'm') && (*(buf + 4) == 'a') && (*(buf + 5) == 'l') && (*(buf + 6) == '\n') && (*(buf + 7) == '\0'))
+-		new_freq = 0;
+-	else if ((*(buf + 0) == 'f') && (*(buf + 1) == 'a') && (*(buf + 2) == 's') && (*(buf + 3) == 't') && (*(buf + 4) == '\n') && (*(buf + 5) == '\0'))
+-		new_freq = 1;
+-	else 
+-		return -EINVAL;
+-
+-	frequency &= !CTRL_SPEED_MASK;
+-	new_freq <<= 11;
+-	frequency |= new_freq;
+-	iowrite32(frequency, pds14dev->base_addr +  PDS14_CTRL_OFFSET);
+-	return count;
+-	
+-}
+-static DEVICE_ATTR_RW(current_freq);
+-
+-static ssize_t available_freq_show(struct device *child, struct device_attribute *attr, char *buf)
+-{
+-	return sprintf(buf, "available sampling frequencies: (normal, fast)\n");
+-}
+-static DEVICE_ATTR_RO(available_freq);
+-
+-static __poll_t data_mV_poll(struct file *filp, poll_table *wait) {
+-
+-	struct pds14_mms *pds14dev;
+-	__poll_t retval_mask = 0;
+-	
+-	pds14dev = filp->private_data;
+-
+-	poll_wait(filp, &read_wq, wait);
+-
+-	if (pds14dev->alarm) {
+-		retval_mask = POLLIN|POLLRDNORM;
+-		pds14dev->alarm = 0;
+-	} else {
+-		retval_mask = 0;
+-	}
+-
+-	return retval_mask;
+-}
+-
+-static ssize_t data_mV_show(struct device *child, struct device_attribute *attr, char *buf)
+-{
+-	struct pds14_mms *pds14dev = dev_get_drvdata(child);
+-
+-	u32 resolution = ioread32(pds14dev->base_addr + PDS14_CTRL_OFFSET);
+-	u32 data = ioread32(pds14dev->base_addr + PDS14_DATA_OFFSET);
+-	u32 data_mV;
+-
+-	data &= DATA_MASK; // raw data
+-	resolution &= CTRL_RES_MASK;
+-	resolution >>= 10;
+-	
+-	data_mV = raw_to_mV(data, resolution);
+-
+-	return sprintf(buf, "%d mV\n", data_mV);
+-}
+-static DEVICE_ATTR_RO(data_mV);
+-
+-static struct file_operations pds14dev_fops = {
+-	.owner = THIS_MODULE,
+-	.open = pds14dev_open,
+-	.release = pds14dev_release,
+-	.read = pds14dev_read,
+-	.poll = data_mV_poll,
+-};
+-
+-static struct attribute *pds14_mms_attrs[] = {
+-	&dev_attr_enable.attr,
+-	&dev_attr_int_en.attr,
+-	&dev_attr_data_raw.attr, // moze bez ovoga samo za proveru
+-	&dev_attr_available_res.attr,
+-	&dev_attr_current_res.attr,
+-	&dev_attr_current_freq.attr,
+-	&dev_attr_available_freq.attr,
+-	&dev_attr_data_mV.attr,
+-	NULL,
+-};
+-
+-ATTRIBUTE_GROUPS(pds14_mms);
+-
+-static irqreturn_t pds14_isr(int irq, void *data)
+-{
+-	struct pds14_mms *pds14dev = data;
+-
+-	sysfs_notify(&pds14dev->dev->kobj, NULL, "data_mV");
+-
+-	wake_up_interruptible(&read_wq);
+-
+-	pds14dev->alarm = 1;	
+-
+-	iowrite32(0, pds14dev->base_addr + PDS14_STATUS_OFFSET);
+-
+-	return IRQ_HANDLED;
+-}
+-
+-static const struct of_device_id pds14_of_match[] = {
+-	{ .compatible = "arm,versatile-mms", },
+-	{ /* end of table */ }
+-};
+-MODULE_DEVICE_TABLE(of, pds14_of_match);
+-
+-static int pds14_setup(struct device *parent)
+-{
+-	int ret;
+-	dev_t devt;
+-	struct pds14_mms *pds14dev;
+-
+-	pds14dev = dev_get_drvdata(parent);
+-
+-	ret = alloc_chrdev_region(&devt, 0, 1, DEVICE_FILE_NAME);
+-	if (ret < 0) {
+-		dev_err(parent, "failed to alloc chrdev region\n");
+-		goto fail_alloc_chrdev_region;
+-	}
+-	pds14dev->devt = devt;
+-
+-	cdev_init(&pds14dev->cdev, &pds14dev_fops);
+-	ret = cdev_add(&pds14dev->cdev, devt, 1);
+-	if (ret < 0) {
+-		dev_err(parent, "failed to add cdev\n");
+-		goto fail_add_cdev;
+-	}
+-
+-	pds14_class = class_create(THIS_MODULE, "pds14");
+-	if (!pds14_class) {
+-		ret = -EEXIST;
+-		dev_err(parent, "failed to create class\n");
+-		goto fail_create_class;
+-	}
+-
+-	pds14dev->dev = device_create_with_groups(pds14_class, parent, devt, pds14dev, pds14_mms_groups, "%s%d", DEVICE_FILE_NAME, MINOR(devt));
+-	if (IS_ERR(pds14dev->dev)) {
+-		pds14dev->dev = NULL;
+-		ret = -EINVAL;
+-		dev_err(parent, "failed to create device\n");
+-		goto fail_create_device;
+-	}
+-
+-	return 0;
+-
+-fail_create_device:
+-	class_destroy(pds14_class);
+-fail_create_class:
+-	cdev_del(&pds14dev->cdev);
+-fail_add_cdev:
+-	unregister_chrdev_region(devt, 1);
+-fail_alloc_chrdev_region:
+-	return ret;
+-}
+-
+-static int pds14_probe(struct platform_device *pdev)
+-{
+-	int ret;
+-	struct pds14_mms *pds14dev;
+-	struct resource *res;
+-	const struct of_device_id *match;
+-
+-	pds14dev = devm_kzalloc(&pdev->dev, sizeof(*pds14dev), GFP_KERNEL);
+-	if (!pds14dev)
+-		return -ENOMEM;
+-
+-	pds14dev->parent = &pdev->dev;
+-
+-	match = of_match_node(pds14_of_match, pdev->dev.of_node);
+-	if (!match) {
+-		dev_err(&pdev->dev, "of_match_node() failed\n");
+-		return -EINVAL;
+-	}
+-
+-	platform_set_drvdata(pdev, pds14dev);
+-
+-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+-	pds14dev->base_addr = devm_ioremap_resource(&pdev->dev, res);
+-	if (IS_ERR(pds14dev->base_addr))
+-		return PTR_ERR(pds14dev->base_addr);
+-
+-	pds14dev->irq = platform_get_irq(pdev, 0);
+-	if (pds14dev->irq < 0) {
+-		dev_err(&pdev->dev, "invalid IRQ\n");
+-		return pds14dev->irq;
+-	}
+-	ret = devm_request_irq(&pdev->dev, pds14dev->irq, pds14_isr, 0, dev_name(&pdev->dev), pds14dev);
+-	if (ret < 0) {
+-		dev_err(&pdev->dev, "unable to request IRQ\n");
+-		return ret;
+-	}
+-
+-	/* initialize device */
+-	ret = pds14_setup(&pdev->dev);
+-	if (ret < 0) {
+-		dev_err(&pdev->dev, "failed to create device\n");
+-		return ret;
+-	}
+-
+-	return 0;
+-}
+-
+-static int pds14_remove(struct platform_device *pdev)
+-{
+-	struct pds14_mms *pds14dev;
+-
+-	pds14dev = dev_get_drvdata(&pdev->dev);
+-
+-	device_destroy(pds14_class, pds14dev->devt);
+-	class_destroy(pds14_class);
+-	cdev_del(&pds14dev->cdev);
+-	unregister_chrdev_region(pds14dev->devt, 1);
+-
+-	return 0;
+-}
+-
+-static struct platform_driver pds14_driver = {
+-	.driver = {
+-		.name = DRIVER_NAME,
+-		.of_match_table = pds14_of_match,
+-	},
+-	.probe = pds14_probe,
+-	.remove = pds14_remove,
+-};
+-
+-static int __init mms_init(void)
+-{
+-	pr_alert("Hello, world!\n");
+-	return platform_driver_register(&pds14_driver);
+-}
+-
+-static void __exit mms_exit(void)
+-{
+-	pr_alert("Goodbye, world!\n");
+-	return platform_driver_unregister(&pds14_driver);
+-}
+-
+-module_init(mms_init);
+-module_exit(mms_exit);
+-MODULE_LICENSE("GPL");
+-MODULE_DESCRIPTION("Driver for memory mapped sensor");
+-MODULE_AUTHOR("Pavle Lakic (ETF Belgrade)");
