@@ -1,5 +1,5 @@
 diff --git a/Kconfig b/Kconfig
-index 2e2ffe7..6b22c02 100644
+index 2e2ffe7..4bacd8f 100644
 --- a/Kconfig
 +++ b/Kconfig
 @@ -7,6 +7,13 @@ menu "Character devices"
@@ -7,17 +7,17 @@ index 2e2ffe7..6b22c02 100644
  source "drivers/tty/Kconfig"
  
 +config PDS14_DRIVER
-+	tristate "Platform character device driver PDS14"
++	tristate "Driver made by Pavle Lakic PDS14"
 +	depends on ARCH_VEXPRESS
 +	default y
 +	help
-+	  Student made driver. When in doubt, say "N".
++	  This is student made driver, prone to errors, when in doubt, say "N".
 +
  config DEVMEM
  	bool "/dev/mem virtual device support"
  	default y
 diff --git a/Makefile b/Makefile
-index b8d42b4..9ff75cd 100644
+index b8d42b4..d883939 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -58,3 +58,4 @@ js-rtc-y = rtc.o
