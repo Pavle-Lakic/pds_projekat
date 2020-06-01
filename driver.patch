@@ -24,7 +24,7 @@ index b8d42b4..9ff75cd 100644
  obj-$(CONFIG_XILLYBUS)		+= xillybus/
  obj-$(CONFIG_POWERNV_OP_PANEL)	+= powernv-op-panel.o
  obj-$(CONFIG_ADI)		+= adi.o
-+obj-$(PDS14_DRIVER)	+= pds-mmsens.o
++obj-$(CONFIG_PDS14_DRIVER)	+= pds-mmsens.o
 diff --git a/pds-mmsens.c b/pds-mmsens.c
 new file mode 100644
 index 0000000..1a81857
