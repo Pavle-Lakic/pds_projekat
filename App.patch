@@ -24,10 +24,10 @@ index 0000000..120516f
 +	rm -f app
 diff --git a/app.c b/app.c
 new file mode 100644
-index 0000000..e07896e
+index 0000000..f35429e
 --- /dev/null
 +++ b/app.c
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,226 @@
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <sys/types.h>
@@ -115,8 +115,6 @@ index 0000000..e07896e
 +	char query[200];
 +	unsigned char DATA_LOW;			// DATA_L will be stored here
 +	signed char DATA_HIGH;			// DATA_H will be stored here
-+	unsigned short DATA_L_MASK = 0x00f0;
-+	unsigned short DATA_H_MASK = 0xff00;
 +
 +	fd = open("/dev/i2c-2", O_RDWR);    	// open i2c file
 +
