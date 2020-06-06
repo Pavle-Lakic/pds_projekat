@@ -1,0 +1,258 @@
+diff --git a/Makefile b/Makefile
+new file mode 100644
+index 0000000..120516f
+--- /dev/null
++++ b/Makefile
+@@ -0,0 +1,18 @@
++CC=arm-linux-gnueabihf-gcc
++MCPU=cortex-a9
++
++CFLAGS=-g -mcpu=${MCPU}
++LDFLAGS=-lpthread -lsqlite3
++
++OBJS=app.o
++
++all: app
++
++app: ${OBJS}
++	${CC} ${CFLAGS} $? -o $@ ${LDFLAGS}
++
++.PHONY: clean
++
++clean:
++	rm -f *.o
++	rm -f app
+diff --git a/app.c b/app.c
+new file mode 100644
+index 0000000..e07896e
+--- /dev/null
++++ b/app.c
+@@ -0,0 +1,228 @@
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <sys/time.h>
++#include <sys/timerfd.h>
++#include <sys/ioctl.h>
++#include <linux/i2c-dev.h>
++#include <pthread.h>
++#include <sqlite3.h>
++#include <poll.h>
++
++#define DEBUG	0
++
++int rc;
++sqlite3 *db;
++char *err_msg = 0;
++char *sql = "DROP  TABLE IF  EXISTS  Samples;"
++	"CREATE  TABLE  Samples(Id INT , Time INT , Data  REAL);"
++	"DROP  TABLE IF  EXISTS  Temperature;"
++	"CREATE  TABLE  Temperature(Id INT , Time INT , Data  REAL);";
++
++pthread_mutex_t sql_mutex;
++
++struct periodic_info
++{
++	int timer_fd;
++	unsigned long long wakeups_missed;
++};
++
++static int make_periodic (unsigned int period, struct periodic_info *info)
++{
++	int ret;
++	unsigned int ns;
++	unsigned int sec;
++	int fd;
++	struct itimerspec itval;
++
++	/* Create the timer */
++	fd = timerfd_create (CLOCK_MONOTONIC, 0);
++	info->wakeups_missed = 0;
++	info->timer_fd = fd;
++	if (fd == -1)
++		return fd;
++
++	/* Make the timer periodic */
++	sec = period/1000000;
++	ns = (period - (sec * 1000000)) * 1000;
++	itval.it_interval.tv_sec = sec;
++	itval.it_interval.tv_nsec = ns;
++	itval.it_value.tv_sec = sec;
++	itval.it_value.tv_nsec = ns;
++	ret = timerfd_settime (fd, 0, &itval, NULL);
++	return ret;
++}
++
++static void wait_period (struct periodic_info *info)
++{
++	unsigned long long missed;
++	int ret;
++
++	/* Wait for the next timer event. If we have missed any the
++	   number is written to "missed" */
++	ret = read (info->timer_fd, &missed, sizeof (missed));
++	if (ret == -1)
++	{
++		perror ("read timer");
++		return;
++	}
++
++	/* "missed" should always be >= 1, but just to be sure, check it is not 0 anyway */
++	if (missed > 0)
++		info->wakeups_missed += (missed - 1);
++}
++
++
++void *i2c_sensor(void *ptr) 
++{
++	int fd = (int)ptr;             			
++	unsigned char buf[4];			// this register will be used 
++	float temperature;
++	struct periodic_info info;
++	char query[200];
++	unsigned char DATA_LOW;			// DATA_L will be stored here
++	signed char DATA_HIGH;			// DATA_H will be stored here
++	unsigned short DATA_L_MASK = 0x00f0;
++	unsigned short DATA_H_MASK = 0xff00;
++
++	fd = open("/dev/i2c-2", O_RDWR);    	// open i2c file
++
++	if (fd == -1) {
++		perror("open /dev/i2c-2 error\n");
++	}
++
++	if (ioctl(fd, I2C_SLAVE, 0x5f) < 0) {    // set i2c slave address
++		perror("set i2c slave addres ioctl error\n");
++	}
++
++	/*enable i2c by writing to its CTRL reg*/
++	buf[0] = 0x00;
++	buf[1] = 1 << 6;
++	if (write(fd, buf, 2) != 2) {    
++		perror("Choosing and writing to CTRL register error\n");
++	}
++
++	make_periodic(2000000, &info);
++
++	while(1) {
++
++		wait_period(&info);
++	
++		/*choose DATA register to read from*/
++		buf[0] = 0x02;
++		if (write(fd, buf, 1) != 1) {    
++			perror("Choosing DATA error\n");
++		}
++		/*read first two bytes from DATA register
++		  DATA_L will be stored in buf[0], while DATA_H
++		  will be stored in buf [1]*/
++		if (read(fd, buf, 2) != 2) {
++			perror("Read from DATA register error\n");
++		}
++
++		/*4 bit value, only the first 4 most significant bits matter*/
++		DATA_LOW = buf[0]>>4;
++		DATA_HIGH = buf[1];
++		temperature = (float)DATA_LOW;
++
++		if (DEBUG) {
++			printf("DATA_LOW = %u\n", DATA_LOW);
++			printf("DATA_HIGH = %d", DATA_HIGH);
++		}
++		
++		if (DATA_HIGH > 0)  {
++			/*temperature is currently DATA_LOW cast to float, shift DATA_HIGH to the left
++			  to get true value, then divide all by 16 to set it in format Q8.4*/
++			temperature = (float)((DATA_LOW + (DATA_HIGH << 4))/16);
++		}
++		 else {
++			/*for negative values of DATA_HIGH*/
++			temperature = (float)(((DATA_HIGH << 4) - DATA_LOW)/16);
++		}
++		
++		printf("Temperature is %f\n", temperature);
++
++		pthread_mutex_lock(&sql_mutex);	
++		sprintf(query , "INSERT  INTO  Temperature(Time , Data) VALUES  (%u,%f);",(unsigned)time(NULL), temperature);
++		
++		rc = sqlite3_exec(db, query , 0, 0, &err_msg);
++
++		pthread_mutex_unlock(&sql_mutex);	
++	}
++}
++
++int main(void)
++{
++	int fd;
++	char buffer[10] = {0};
++	int ret;
++	struct pollfd pfd;
++	float voltage;
++	pthread_t i2c_thread;
++	char query[200];
++
++	rc = sqlite3_open("/www/test.db", &db);
++	rc = sqlite3_exec(db, sql , 0, 0, &err_msg);
++
++	pthread_create(&i2c_thread, NULL, i2c_sensor, (void *)fd);
++	pthread_mutex_init(&sql_mutex,NULL);
++
++	/*enable*/
++	fd = open("/sys/class/pds14/pds14_mmsensor0/enable", O_RDWR);
++	if (fd == -1) {
++		perror("Can't open /sys/class/pds14/pds14_mmsensor0/enable");
++        	return 1;
++	}
++
++	ret = write(fd, "1", 1);
++	lseek(fd, 0, SEEK_SET);
++
++	/*enable interrupt*/
++	fd = open("/sys/class/pds14/pds14_mmsensor0/int_en", O_RDWR);
++	if (fd == -1) {
++		perror("Can't open /sys/class/pds14/pds14_mmsensor0/int_en");
++        	return 1;
++	}
++
++	ret = write(fd, "1", 1);
++	lseek(fd, 0, SEEK_SET);
++
++
++	/*read data_mV*/
++	fd = open("/sys/class/pds14/pds14_mmsensor0/data_mV", O_RDONLY);
++	if (fd == -1) {
++		perror("Can't open /sys/class/pds14/pds14_mmsensor0/data_mV");
++        return 1;
++	}
++
++	pfd.fd = fd;
++    	pfd.events = POLLPRI|POLLERR;
++
++	while(1) {
++
++		ret = poll(&pfd, 1, -1);
++
++		if (ret > 0) {			
++			ret = read(pfd.fd, buffer, sizeof(buffer));
++			lseek(fd, 0, SEEK_SET);
++			
++			voltage = ((float)(atoi(buffer)))/1000;
++			printf("voltage = %f V\n", voltage);
++
++			pthread_mutex_lock(&sql_mutex);
++
++			sprintf(query , "INSERT  INTO  Samples(Time , Data) VALUES  (%u,%f);",(unsigned)time(NULL), voltage);
++		
++			rc = sqlite3_exec(db, query , 0, 0, &err_msg);
++	
++			pthread_mutex_unlock(&sql_mutex);
++
++		}
++	}
++	close(fd);
++	return 0;
++}
++
