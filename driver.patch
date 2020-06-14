@@ -27,7 +27,7 @@ index b8d42b4..d883939 100644
 +obj-$(CONFIG_PDS14_DRIVER)	+= pds-mmsens.o
 diff --git a/pds-mmsens.c b/pds-mmsens.c
 new file mode 100644
-index 0000000..1a81857
+index 0000000..432394c
 --- /dev/null
 +++ b/pds-mmsens.c
 @@ -0,0 +1,501 @@
@@ -262,7 +262,7 @@ index 0000000..1a81857
 +	else 
 +		return -EINVAL;
 +
-+	resolution &= !CTRL_RES_MASK;
++	resolution &= ~CTRL_RES_MASK;
 +	new_res <<= 10;
 +	resolution |= new_res;
 +	iowrite32(resolution, pds14dev->base_addr +  PDS14_CTRL_OFFSET);
